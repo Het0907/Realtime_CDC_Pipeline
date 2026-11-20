@@ -1,0 +1,35 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Demo and runtime logs
+.demo-consumer-*.log
+.demo-consumer-*.err.log
+*.tmp
+
+# Generated pipeline data
+bronze_layer/
+silver/
+gold/
+spark_bronze/
+checkpoints/
+Queries/
+*.duckdb
+*.duckdb.wal
+
+# dbt
+dbt_project/logs/
+dbt_project/target/
+dbt_project/.user.yml
+
+# Great Expectations runtime state
+data_quality/gx/gx/uncommitted/
+
+# Local package downloads
+deltalake-*.whl

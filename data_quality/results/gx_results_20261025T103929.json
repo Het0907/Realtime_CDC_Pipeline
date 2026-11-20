@@ -1,0 +1,103 @@
+{
+  "run_timestamp": "2026-10-25T10:39:29.650550+00:00",
+  "tables": {
+    "customers": {
+      "passed": 6,
+      "failed": 0,
+      "checks": [
+        {
+          "name": "Row count > 0",
+          "passed": true,
+          "detail": "Got 11 rows"
+        },
+        {
+          "name": "id is unique",
+          "passed": true,
+          "detail": "Unique ids: 11"
+        },
+        {
+          "name": "email not null",
+          "passed": true,
+          "detail": "Nulls: 0"
+        },
+        {
+          "name": "email contains @",
+          "passed": true,
+          "detail": "All emails must contain @"
+        },
+        {
+          "name": "first_name not null",
+          "passed": true,
+          "detail": "Nulls: 0"
+        },
+        {
+          "name": "_cdc_op in valid set",
+          "passed": true,
+          "detail": "Values: ['c', 'u', 'd', 'r']"
+        }
+      ]
+    },
+    "orders": {
+      "passed": 5,
+      "failed": 0,
+      "checks": [
+        {
+          "name": "Row count > 0",
+          "passed": true,
+          "detail": "Got 3 rows"
+        },
+        {
+          "name": "id is unique",
+          "passed": true,
+          "detail": "Unique ids: 3"
+        },
+        {
+          "name": "quantity > 0",
+          "passed": true,
+          "detail": "Min quantity: 1"
+        },
+        {
+          "name": "purchaser not null",
+          "passed": true,
+          "detail": "Nulls: 0"
+        },
+        {
+          "name": "product_id not null",
+          "passed": true,
+          "detail": "Nulls: 0"
+        }
+      ]
+    },
+    "products": {
+      "passed": 5,
+      "failed": 0,
+      "checks": [
+        {
+          "name": "Row count > 0",
+          "passed": true,
+          "detail": "Got 10 rows"
+        },
+        {
+          "name": "id is unique",
+          "passed": true,
+          "detail": "Unique ids: 10"
+        },
+        {
+          "name": "name not null",
+          "passed": true,
+          "detail": "Nulls: 0"
+        },
+        {
+          "name": "weight > 0",
+          "passed": true,
+          "detail": "Min weight: 0.1"
+        },
+        {
+          "name": "description not null",
+          "passed": true,
+          "detail": "Nulls: 0"
+        }
+      ]
+    }
+  }
+}

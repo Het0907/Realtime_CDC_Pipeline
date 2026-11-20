@@ -1,0 +1,111 @@
+version: 2
+
+# ═══════════════════════════════════════════════════════════════
+# DATA CONTRACTS — schema docs + column-level tests
+# These act as formal guarantees about shape and quality of data.
+# ═══════════════════════════════════════════════════════════════
+
+models:
+
+  # ── Staging ──────────────────────────────────────────────────
+
+  - name: stg_customers
+    description: >
+      Clean, active customer records sourced from the Silver Delta table.
+      Excludes soft-deleted rows. One row per customer.
+    columns:
+      - name: customer_id
+        description: Surrogate key from Postgres SERIAL
+        tests:
+          - unique
+          - not_null
+      - name: email
+        description: Customer email address — must be unique
+        tests:
+          - unique
+          - not_null
+      - name: full_name
+        description: Concatenated first + last name
+        tests:
+          - not_null
+      - name: cdc_operation
+        description: CDC op code (c=create, u=update, r=snapshot)
+        tests:
+          - accepted_values:
+              values: ['c', 'u', 'r', 'd']
+
+  - name: stg_orders
+    description: >
+      Cleaned order records from Silver Delta. Debezium epoch dates decoded.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        description: FK → stg_customers.customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+      - name: quantity
+        description: Must be a positive integer
+        tests:
+          - not_null
+      - name: order_date
+        tests:
+          - not_null
+
+  - name: stg_products
+    description: Active product catalog from Silver Delta.
+    columns:
+      - name: product_id
+        tests:
+          - unique
+          - not_null
+      - name: product_name
+        tests:
+          - not_null
+      - name: weight_kg
+        description: Product weight in kg — must be positive
+
+  # ── Marts ─────────────────────────────────────────────────────
+
+  - name: orders_with_customers
+    description: >
+      Wide enriched orders table joining orders, customers, and products.
+      Primary fact table for dashboard.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_name
+        tests:
+          - not_null
+
+  - name: customer_order_summary
+    description: >
+      One row per customer with aggregated order metrics and segment.
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_segment
+        tests:
+          - accepted_values:
+              values: ['VIP', 'Returning', 'New']
+
+  - name: product_sales_summary
+    description: >
+      One row per product with sales aggregates and sales rank.
+    columns:
+      - name: product_id
+        tests:
+          - unique
+          - not_null
+      - name: sales_rank
+        tests:
+          - not_null

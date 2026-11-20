@@ -1,0 +1,38 @@
+services:
+  airflow:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    container_name: cdc-airflow
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create --username "$${AIRFLOW_ADMIN_USERNAME}" --password "$${AIRFLOW_ADMIN_PASSWORD}" --firstname Local --lastname Admin --role Admin --email admin@example.com || true
+        airflow scheduler &
+        exec airflow webserver
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      AIRFLOW_ADMIN_USERNAME: admin
+      AIRFLOW_ADMIN_PASSWORD: admin
+    volumes:
+      - airflow-data:/opt/airflow
+      - .:/opt/airflow/project
+      - ./pipeline/airflow_dag.py:/opt/airflow/dags/cdc_lakehouse_pipeline.py
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  airflow-data:

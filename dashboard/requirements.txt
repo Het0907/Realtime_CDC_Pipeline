@@ -1,0 +1,7 @@
+streamlit==1.35.0
+plotly==5.22.0
+pandas==2.2.2
+duckdb==0.10.3
+deltalake==0.18.2
+pyarrow==15.0.2
+rich==13.7.1

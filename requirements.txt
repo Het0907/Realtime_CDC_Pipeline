@@ -1,0 +1,28 @@
+# CDC / Streaming
+kafka-python
+
+# Open Table Format (Delta Lake)
+deltalake
+pyarrow
+
+# SQL / Analytics Engine
+duckdb
+
+# Data Transformations (dbt)
+dbt-core
+dbt-duckdb
+
+# Data Quality Gate
+great-expectations
+
+# Dashboard & Visualizations
+streamlit
+plotly
+altair
+
+# Data manipulation
+pandas
+
+# Utilities
+python-dotenv
+rich
