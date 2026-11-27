@@ -31,7 +31,6 @@ if TYPE_CHECKING:                                          # pragma: no cover
     from airflow import DAG  # type: ignore
     from airflow.operators.bash import BashOperator  # type: ignore
     from airflow.operators.python import BranchPythonOperator  # type: ignore
-    from airflow.utils.trigger_rule import TriggerRule  # type: ignore
 
 
 def _airflow_available() -> bool:
@@ -46,7 +45,6 @@ def _airflow_available() -> bool:
 if _airflow_available():
     from airflow import DAG  # type: ignore
     from airflow.operators.bash import BashOperator  # type: ignore
-    from airflow.utils.trigger_rule import TriggerRule  # type: ignore
 
     PROJECT_ROOT = "/opt/airflow/project"   # adjust to your mounted volume path
 
@@ -88,7 +86,7 @@ if _airflow_available():
         dbt_staging = BashOperator(
             task_id="dbt_staging",
             bash_command=(
-                f"cd {PROJECT_ROOT}/dbt_project && "
+                f"cd {PROJECT_ROOT}/dbt_project && mkdir -p ../gold && "
                 "dbt run --select staging.* --profiles-dir . --project-dir ."
             ),
         )
@@ -111,25 +109,13 @@ if _airflow_available():
             ),
         )
 
-        # ── Stage 6: Dashboard data refresh signal ────────────────────────────
-        dashboard_signal = BashOperator(
-            task_id="dashboard_refresh_signal",
-            bash_command=(
-                f"touch {PROJECT_ROOT}/dashboard/.last_refresh "
-                f"&& echo 'Dashboard refresh signalled at $(date)'"
-            ),
-            trigger_rule=TriggerRule.ALL_SUCCESS,
-        )
-
         # ── DAG Dependencies ──────────────────────────────────────────────────
-        # silver → quality gate → dbt staging → dbt marts → dbt tests → dashboard
         (
             silver_processor
             >> data_quality_gate
             >> dbt_staging
             >> dbt_marts
             >> dbt_tests
-            >> dashboard_signal
         )
 
 else:

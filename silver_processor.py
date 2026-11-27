@@ -6,12 +6,8 @@ a fallback, and writes them into Delta Lake tables in the silver/ directory.
 
 Compatible with deltalake >= 1.0 (delta-rs).
 
-Key features:
-  - MERGE (upsert) -- exactly-once semantics for inserts and updates
-  - Hard-delete handling -- soft-deletes rows on CDC op='d'
-  - Late-arriving data -- events are ordered by event timestamp, not file mtime
-  - Schema evolution -- new columns handled automatically on initial write
-  - Metadata columns -- _cdc_op, _event_ts, _ingested_at preserved on every row
+Applies CDC upserts and soft deletes with event ordering and additive schema
+evolution. Set CDC_BRONZE_SOURCE to spark or json to select a specific input.
 
 Usage:
     pip install -r requirements.txt
@@ -24,16 +20,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import pyarrow as pa
-from deltalake import DeltaTable, write_deltalake
+from deltalake import DeltaTable, QueryBuilder, write_deltalake
+from pandas.api.types import is_object_dtype
 from rich.console import Console
 from rich.table import Table as RichTable
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-BRONZE_DIR = Path("bronze_layer")
-SPARK_BRONZE_DIR = Path("spark_bronze/events")
-SILVER_DIR = Path("silver")
+PROJECT_ROOT = Path(__file__).resolve().parent
+BRONZE_DIR = PROJECT_ROOT / "bronze_layer"
+SPARK_BRONZE_DIR = PROJECT_ROOT / "spark_bronze/events"
+SILVER_DIR = PROJECT_ROOT / "silver"
 TABLES = ["customers", "orders", "products"]
+ORDER_COLUMNS = ["_event_ts", "_kafka_partition", "_kafka_offset"]
 
 # Primary key per table — used for MERGE predicate
 PRIMARY_KEYS = {
@@ -54,53 +52,64 @@ def load_json_bronze_events(table: str) -> list[dict]:
     if not table_dir.exists():
         return events
     for f in sorted(table_dir.glob("*.json")):
-        with open(f) as fp:
-            events.append(json.load(fp))
+        with f.open(encoding="utf-8") as fp:
+            event = json.load(fp)
+        # Older JSON records stored Kafka coordinates only in the filename.
+        parts = f.stem.rsplit("_", 2)
+        if len(parts) == 3 and parts[-2].isdigit() and parts[-1].isdigit():
+            event.setdefault("partition", int(parts[-2]))
+            event.setdefault("offset", int(parts[-1]))
+        event["location"] = f.name
+        events.append(event)
     return events
 
 
 def load_spark_bronze_events(table: str) -> list[dict]:
     """Load CDC events from the Spark Structured Streaming Delta Bronze table."""
+    if table not in TABLES:
+        raise ValueError(f"Unknown CDC table: {table}")
     if not DeltaTable.is_deltatable(str(SPARK_BRONZE_DIR)):
         return []
 
-    frame = DeltaTable(str(SPARK_BRONZE_DIR)).to_pandas()
-    frame = frame[frame["table"] == table] if "table" in frame.columns else frame.iloc[0:0]
+    bronze = DeltaTable(str(SPARK_BRONZE_DIR))
+    columns = ("topic", "partition", "offset", "operation", "event_ts",
+               "before_json", "after_json", "ingested_at")
+    projection = ", ".join(f'"{column}"' for column in columns)
+    records = QueryBuilder().register("bronze", bronze).execute(
+        f"""SELECT {projection} FROM bronze WHERE "table" = '{table}'"""
+    ).read_all()
+    rows = zip(*(records.column(name).to_pylist() for name in columns), strict=True)
     events = []
 
-    for _, row in frame.iterrows():
-        def decode_json(value):
-            if value is None or pd.isna(value):
-                return None
-            return json.loads(value)
-
+    for topic, partition, offset, op, event_ts, before, after, ingested_at in rows:
         events.append({
             "table": table,
-            "operation": row.get("operation", "unknown"),
-            "timestamp_ms": int(row.get("event_ts", 0) or 0),
-            "before": decode_json(row.get("before_json")),
-            "after": decode_json(row.get("after_json")),
-            "ingested_at": str(row.get("ingested_at", "")),
+            "operation": op,
+            "timestamp_ms": event_ts or 0,
+            "before": json.loads(before) if before is not None else None,
+            "after": json.loads(after) if after is not None else None,
+            "ingested_at": str(ingested_at) if ingested_at is not None else "",
+            "partition": partition,
+            "offset": offset,
+            "location": f"{topic}:{partition}:{offset}",
         })
 
     return events
 
 
-def load_bronze_events(table: str) -> list[dict]:
-    """Load Spark Bronze events, falling back to JSON Bronze when unavailable."""
-    events = load_spark_bronze_events(table)
-    if not events:
-        events = load_json_bronze_events(table)
-    # Sort by CDC event timestamp to handle late-arriving data.
-    events.sort(key=lambda e: e.get("timestamp_ms", 0))
-    return events
+def load_bronze_events(table: str, source: str | None = None) -> list[dict]:
+    source = source or bronze_source()
+    return load_spark_bronze_events(table) if source == "spark" else load_json_bronze_events(table)
 
 
 def bronze_source() -> str:
-    """Return the active Bronze source for status output."""
-    if DeltaTable.is_deltatable(str(SPARK_BRONZE_DIR)):
-        return "spark_bronze/events"
-    return "bronze_layer JSON"
+    """Select one Bronze source for all tables in a run."""
+    source = os.environ.get("CDC_BRONZE_SOURCE", "auto").lower()
+    if source in {"json", "spark"}:
+        return source
+    if source != "auto":
+        raise ValueError("CDC_BRONZE_SOURCE must be auto, spark, or json")
+    return "spark" if DeltaTable.is_deltatable(str(SPARK_BRONZE_DIR)) else "json"
 
 
 def build_silver_row(event: dict) -> dict | None:
@@ -110,7 +119,7 @@ def build_silver_row(event: dict) -> dict | None:
     """
     op = event.get("operation", "unknown")
     # For deletes, 'after' is null — use 'before' to know which id to remove
-    row_data = event.get("after") or event.get("before")
+    row_data = event.get("before") if op == "d" else event.get("after")
     if row_data is None:
         return None
 
@@ -118,7 +127,9 @@ def build_silver_row(event: dict) -> dict | None:
 
     # Add CDC metadata columns
     row["_cdc_op"]       = op                              # c/u/d/r
-    row["_event_ts"]     = int(event.get("timestamp_ms", 0))  # source event time (ms)
+    row["_event_ts"]     = int(event.get("timestamp_ms") or 0)
+    row["_kafka_partition"] = event.get("partition", -1)
+    row["_kafka_offset"] = event.get("offset", -1)
     row["_ingested_at"]  = str(event.get("ingested_at", ""))  # when consumer.py wrote it
     row["_processed_at"] = datetime.now(timezone.utc).isoformat()
     row["_is_deleted"]   = (op == "d")
@@ -129,7 +140,7 @@ def build_silver_row(event: dict) -> dict | None:
 def events_to_dataframe(events: list[dict], table: str) -> pd.DataFrame:
     """
     Convert CDC events to a pandas DataFrame.
-    Handles late-arriving data by deduplicating on (pk, event_ts) — keeping latest.
+    Keeps the latest event per primary key using timestamp and Kafka coordinates.
     """
     rows = []
     for event in events:
@@ -143,13 +154,13 @@ def events_to_dataframe(events: list[dict], table: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
 
     pk = PRIMARY_KEYS[table]
-    if pk in df.columns:
-        # Keep only the latest event per primary key (handles late-arriving duplicates)
-        df = (
-            df.sort_values("_event_ts", ascending=True)
-              .drop_duplicates(subset=[pk], keep="last")
-              .reset_index(drop=True)
-        )
+    if pk not in df.columns or df[pk].isna().any():
+        raise ValueError(f"CDC event for {table} is missing its primary key")
+    df = (
+        df.sort_values(ORDER_COLUMNS, na_position="first")
+          .drop_duplicates(subset=[pk], keep="last")
+          .reset_index(drop=True)
+    )
 
     # Decode Debezium epoch-day integer -> human-readable date string
     if "order_date" in df.columns:
@@ -163,8 +174,9 @@ def events_to_dataframe(events: list[dict], table: str) -> pd.DataFrame:
 def coerce_dtypes(df: pd.DataFrame, table: str) -> pd.DataFrame:
     """Force consistent dtypes so pyarrow doesn't choke on mixed-type columns."""
     # Cast all object columns to string
-    for col in df.select_dtypes(include=["object"]).columns:
-        df[col] = df[col].fillna("").astype(str)
+    for col, dtype in df.dtypes.items():
+        if is_object_dtype(dtype):
+            df[col] = df[col].astype("string")
 
     # Cast bool column
     if "_is_deleted" in df.columns:
@@ -180,9 +192,10 @@ def coerce_dtypes(df: pd.DataFrame, table: str) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
 
-    # event_ts should be int64
-    if "_event_ts" in df.columns:
-        df["_event_ts"] = pd.to_numeric(df["_event_ts"], errors="coerce").fillna(0).astype("int64")
+    for col in ORDER_COLUMNS:
+        df[col] = df[col].fillna(0 if col == "_event_ts" else -1).astype("int64")
+    if df["id"].isna().any():
+        raise ValueError(f"CDC event for {table} has an invalid primary key")
 
     return df
 
@@ -194,11 +207,7 @@ def silver_table_exists(table: str) -> bool:
 
 
 def write_to_silver(df: pd.DataFrame, table: str) -> None:
-    """
-    Write/merge DataFrame into a Delta Lake Silver table.
-    Uses MERGE for upsert semantics (exactly-once). 
-    Falls back to overwrite write on first run.
-    """
+    """Merge newer rows into Silver, or initialize the table on first write."""
     silver_path = str(SILVER_DIR / table)
     pk = PRIMARY_KEYS[table]
     df = coerce_dtypes(df.copy(), table)
@@ -206,6 +215,12 @@ def write_to_silver(df: pd.DataFrame, table: str) -> None:
     if silver_table_exists(table):
         console.log(f"[cyan]Merging {len(df)} rows into existing Silver table: {table}")
         dt = DeltaTable(silver_path)
+        target_columns = {field.name for field in dt.schema().fields}
+        newer = "FALSE"
+        for column in reversed(ORDER_COLUMNS):
+            fallback = 0 if column == "_event_ts" else -1
+            target = f"COALESCE(target.{column}, {fallback})" if column in target_columns else str(fallback)
+            newer = f"(source.{column} > {target} OR (source.{column} = {target} AND {newer}))"
 
         (
             dt.merge(
@@ -213,8 +228,9 @@ def write_to_silver(df: pd.DataFrame, table: str) -> None:
                 predicate=f"target.{pk} = source.{pk}",
                 source_alias="source",
                 target_alias="target",
+                merge_schema=True,
             )
-            .when_matched_update_all()
+            .when_matched_update_all(predicate=newer)
             .when_not_matched_insert_all()
             .execute()
         )
@@ -225,7 +241,7 @@ def write_to_silver(df: pd.DataFrame, table: str) -> None:
         write_deltalake(
             silver_path,
             df,
-            mode="overwrite",
+            mode="error",
         )
 
 
@@ -234,13 +250,12 @@ def print_silver_summary(table: str) -> None:
     silver_path = str(SILVER_DIR / table)
     try:
         dt = DeltaTable(silver_path)
-        history = dt.history()
         df = dt.to_pandas()
 
         rt = RichTable(title=f"Silver: {table}", show_header=True, header_style="bold magenta")
         rt.add_column("Metric",          style="dim")
         rt.add_column("Value")
-        rt.add_row("Delta version",      str(len(history) - 1))
+        rt.add_row("Delta version",      str(dt.version()))
         rt.add_row("Total rows",         str(len(df)))
         rt.add_row("Columns",            str(len(df.columns)))
         rt.add_row("Column names",       ", ".join(df.columns.tolist()))
@@ -261,16 +276,19 @@ def print_silver_summary(table: str) -> None:
 def main():
     console.rule("[bold green]Silver Layer Processor — Delta Lake")
     SILVER_DIR.mkdir(exist_ok=True)
+    source = bronze_source()
+    if source == "spark" and not DeltaTable.is_deltatable(str(SPARK_BRONZE_DIR)):
+        raise FileNotFoundError(f"Spark Bronze Delta table is missing: {SPARK_BRONZE_DIR}")
 
     for table in TABLES:
         console.rule(f"[bold blue]Processing: {table}")
 
-        events = load_bronze_events(table)
+        events = load_bronze_events(table, source)
         if not events:
             console.log(f"[yellow]No bronze events found for {table}, skipping.")
             continue
 
-        console.log(f"Loaded [bold]{len(events)}[/] events from {bronze_source()} ({table})")
+        console.log(f"Loaded [bold]{len(events)}[/] events from {source} Bronze ({table})")
 
         df = events_to_dataframe(events, table)
         if df.empty:

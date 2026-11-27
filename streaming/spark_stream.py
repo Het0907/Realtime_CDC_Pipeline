@@ -51,7 +51,7 @@ def main() -> None:
         .option("kafka.bootstrap.servers", args.kafka)
         .option("subscribe", ",".join(topics))
         .option("startingOffsets", args.starting_offsets)
-        .option("failOnDataLoss", "false")
+        .option("failOnDataLoss", "true")
         .load()
     )
 

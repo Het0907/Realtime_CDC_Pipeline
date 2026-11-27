@@ -36,31 +36,25 @@ from rich.panel import Panel
 # -- Path setup -----------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).parent.parent
 SILVER_DIR   = PROJECT_ROOT / "silver"
-RESULTS_DIR  = PROJECT_ROOT / "data_quality" / "results"
+RESULTS_DIR  = PROJECT_ROOT / "data_quality" / "runtime_results"
 
 console = Console()
 
 # -- Great Expectations suites -----------------------------------------------
 
 def build_expectations(table: str) -> list[tuple[str, object]]:
-    """Build the GX expectations for one Silver table."""
-    expectations = [
-        ("Row count > 0", ExpectTableRowCountToBeBetween(min_value=1)),
-    ]
+    """Build business rules for active Silver rows."""
+    expectations = []
 
     if table == "customers":
         expectations.extend([
-            ("id is unique", ExpectColumnValuesToBeUnique(column="id")),
             ("email not null", ExpectColumnValuesToNotBeNull(column="email")),
             ("email contains @", ExpectColumnValuesToMatchRegex(column="email", regex=r"@")),
             ("first_name not null", ExpectColumnValuesToNotBeNull(column="first_name")),
-            ("_cdc_op in valid set", ExpectColumnValuesToBeInSet(
-                column="_cdc_op", value_set=["c", "u", "d", "r"]
-            )),
         ])
     elif table == "orders":
         expectations.extend([
-            ("id is unique", ExpectColumnValuesToBeUnique(column="id")),
+            ("quantity not null", ExpectColumnValuesToNotBeNull(column="quantity")),
             ("quantity > 0", ExpectColumnValuesToBeBetween(
                 column="quantity", min_value=0, strict_min=True
             )),
@@ -69,7 +63,7 @@ def build_expectations(table: str) -> list[tuple[str, object]]:
         ])
     elif table == "products":
         expectations.extend([
-            ("id is unique", ExpectColumnValuesToBeUnique(column="id")),
+            ("weight not null", ExpectColumnValuesToNotBeNull(column="weight")),
             ("name not null", ExpectColumnValuesToNotBeNull(column="name")),
             ("weight > 0", ExpectColumnValuesToBeBetween(
                 column="weight", min_value=0, strict_min=True
@@ -81,7 +75,26 @@ def build_expectations(table: str) -> list[tuple[str, object]]:
 
 
 def validate_with_gx(table: str, df: pd.DataFrame) -> list[tuple[str, bool, str]]:
-    """Run a real GX suite against an in-memory pandas batch."""
+    """Check row identity across Silver and business fields on active rows."""
+    checks = evaluate_expectations(table, df, [
+        ("Row count > 0", ExpectTableRowCountToBeBetween(min_value=1)),
+        ("id not null", ExpectColumnValuesToNotBeNull(column="id")),
+        ("id is unique", ExpectColumnValuesToBeUnique(column="id")),
+        ("_is_deleted not null", ExpectColumnValuesToNotBeNull(column="_is_deleted")),
+        ("_cdc_op in valid set", ExpectColumnValuesToBeInSet(
+            column="_cdc_op", value_set=["c", "u", "d", "r"],
+        )),
+    ])
+    if "_is_deleted" in df.columns:
+        active = df.loc[df["_is_deleted"] == False]  # noqa: E712
+        if not active.empty:
+            checks.extend(evaluate_expectations(table, active, build_expectations(table)))
+    return checks
+
+
+def evaluate_expectations(
+    table: str, df: pd.DataFrame, expectations: list[tuple[str, object]]
+) -> list[tuple[str, bool, str]]:
     context = gx.get_context(mode="ephemeral")
     datasource = context.data_sources.add_pandas(name=f"{table}_source")
     asset = datasource.add_dataframe_asset(name=table)
@@ -89,12 +102,13 @@ def validate_with_gx(table: str, df: pd.DataFrame) -> list[tuple[str, bool, str]
     batch = batch_definition.get_batch({"dataframe": df})
 
     suite = gx.ExpectationSuite(name=f"{table}_suite")
-    expectations = build_expectations(table)
     for _, expectation in expectations:
         suite.add_expectation(expectation)
 
     validator = context.get_validator(batch=batch, expectation_suite=suite)
     validation = validator.validate()
+    if len(validation.results) != len(expectations):
+        raise RuntimeError(f"Great Expectations returned an incomplete result for {table}")
     checks = []
     for (label, _), result in zip(expectations, validation.results):
         details = result.result or {}

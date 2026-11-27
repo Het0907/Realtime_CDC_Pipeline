@@ -1,8 +1,8 @@
 # ⚡ CDC Lakehouse Pipeline
 
-> **Postgres → Debezium → Kafka → Delta Lake → dbt → Great Expectations → Streamlit**
+> **Postgres → Debezium → Kafka → Spark → Delta Lake → Great Expectations → dbt → Streamlit**
 >
-> A production-grade Change Data Capture (CDC) pipeline demonstrating real-time ingestion,
+> A local Change Data Capture (CDC) pipeline demonstrating real-time ingestion,
 > open table format storage (Delta Lake), schema evolution, time travel, data contracts,
 > and automated quality gates — all running locally via Docker.
 
@@ -10,65 +10,26 @@
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    PG["Postgres · customers, orders, products"] -->|WAL| DB["Debezium"]
+    DB --> K["Kafka"]
+    K --> S["Spark Structured Streaming"]
+    S --> BD["Bronze Delta · spark_bronze/events"]
+    K --> J["JSON consumer · bronze_layer"]
+    BD --> SL["Silver Delta · CDC upserts and soft deletes"]
+    J -. "JSON demo input" .-> SL
+    A["Airflow · every 15 minutes"] -.-> SL
+    SL --> GX["Great Expectations"]
+    GX -->|Pass| G["dbt Gold marts · DuckDB"]
+    G --> UI["Streamlit · business reporting"]
+    BD --> UI
+    SL --> UI
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        OLTP Source                              │
-│   Postgres (inventory DB: customers, orders, products)          │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ WAL / logical replication
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Debezium + Kafka                             │
-│  Debezium Connect captures row-level changes → Kafka topics     │
-│  Topics: dbserver1.inventory.{customers,orders,products}        │
-│  Kafdrop UI: http://localhost:9000                               │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ kafka-python consumer
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    🥉 Bronze Layer                              │
-│  consumer.py → bronze_layer/{table}/{ts}_{op}_{partition}_{offset}.json │
-│  Raw CDC events, no transformation, append-only                 │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ silver_processor.py
-                           │ • MERGE (exactly-once upsert)
-                           │ • Late-arriving data handling
-                           │ • Schema evolution (mergeSchema)
-                           │ • Soft-delete pattern
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    🥈 Silver Layer (Delta Lake)                 │
-│  silver/{customers,orders,products}/                            │
-│  • Parquet files + _delta_log/ (ACID transaction log)           │
-│  • Time travel: query AS OF any version                         │
-│  • Schema evolution: new columns auto-added                     │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ dbt + DuckDB
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    🥇 Gold Layer (dbt)                          │
-│  dbt_project/models/                                            │
-│  staging/  → stg_customers, stg_orders, stg_products           │
-│  marts/    → orders_with_customers, customer_order_summary,     │
-│              product_sales_summary                              │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ run_checks.py (exits 1 on failure)
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    ✅ Data Quality Gate                         │
-│  Great Expectations checks on Silver tables:                    │
-│  • id uniqueness, email format, quantity > 0, weight > 0        │
-│  • Pipeline STOPS on any violation                              │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    📊 Streamlit Dashboard                       │
-│  dashboard/app.py → http://localhost:8501                       │
-│  Pages: Overview · CDC Feed · Customers · Orders ·              │
-│         Products · Data Quality · Time Travel                   │
-└─────────────────────────────────────────────────────────────────┘
-```
+
+Spark continuously ingests Kafka events into Bronze Delta. Airflow schedules
+the Silver merge, quality checks, and dbt work. Streamlit shows the selected
+Bronze feed, current and historical Silver snapshots, and Gold marts.
 
 ---
 
@@ -93,10 +54,9 @@ From PowerShell, run the complete local demo with one command:
 ```
 
 The runner starts Docker services, registers the Debezium connector if needed,
-starts the bronze consumer, creates customer/product/order insert and update
-events plus a customer delete event, then runs Silver, data quality, dbt, and
-dbt test stages. It is safe to repeat because bronze files use Kafka partition
-and offset in their names and the Silver processor is idempotent.
+starts the JSON Bronze consumer, creates ecommerce changes, waits for all six
+expected events, then runs Silver, data quality, dbt, and dbt test stages.
+Repeating the demo creates a new set of sample rows.
 
 Useful options:
 
@@ -106,12 +66,16 @@ Useful options:
 
 # Keep the consumer logs for troubleshooting
 .\run_demo.ps1 -KeepConsumerLog
+
+# Use an already running inventory stack
+.\run_demo.ps1 -ReuseServices
 ```
 
 After a successful run, launch the dashboard:
 
 ```powershell
-streamlit run dashboard/app.py
+$env:CDC_BRONZE_SOURCE = "json"
+.\.venv\Scripts\python.exe -m streamlit run dashboard/app.py
 ```
 
 ### Spark Structured Streaming path
@@ -128,9 +92,10 @@ append-only Delta Bronze table to `spark_bronze/events`, with a checkpoint at
 `checkpoints/kafka_to_delta`. The full Debezium event is retained in
 `debezium_event`, while common CDC fields are extracted for filtering.
 
-When `spark_bronze/events` exists, `silver_processor.py` consumes it
-automatically. The original `bronze_layer/` JSON path remains as a fallback for
-local troubleshooting and environments without Spark.
+Silver and the dashboard use the same Bronze source selection. The default
+`CDC_BRONZE_SOURCE=auto` selects the Spark Delta table once it exists and uses
+JSON before then. Set `CDC_BRONZE_SOURCE=spark` or `CDC_BRONZE_SOURCE=json`
+to select a specific source. The JSON demo selects JSON for its pipeline run.
 
 Run a bounded catch-up for a demo or recovery test:
 
@@ -304,17 +269,15 @@ Open http://localhost:8501
 ### CDC (Change Data Capture)
 Debezium reads Postgres WAL (Write-Ahead Log) and produces a Kafka message for every INSERT, UPDATE, and DELETE — without any application changes needed.
 
-### Exactly-Once Semantics
-The Silver processor uses Delta Lake's `MERGE` operation:
-- If a row with the same primary key exists → UPDATE it
-- If not → INSERT it
-- This is idempotent — re-running the processor produces the same result
-
-### Late-Arriving Data
-Events are ordered by `timestamp_ms` (the CDC event time) before processing, not by file modification time or ingestion time. This ensures correct ordering even if events arrive out-of-order.
+### Replay and Late Events
+Silver deduplicates each batch by primary key, then merges only events newer
+than the stored row. It compares the Debezium envelope timestamp and uses
+Kafka partition and offset to break ties. Replaying the same event leaves
+Silver unchanged, including when a delete has already been applied.
 
 ### Schema Evolution
-Delta Lake `mergeSchema=True` allows adding new columns without breaking existing readers. If you add a column to Postgres, Debezium will include it in future events and the Silver table will auto-expand.
+Silver enables additive schema evolution on MERGE for new columns in CDC
+events. Existing dbt models continue to select their declared output columns.
 
 ### Time Travel
 Query Silver tables at any historical version:
@@ -328,7 +291,8 @@ df = dt.to_pandas()
 
 # By timestamp
 dt = DeltaTable("silver/customers")
-df = dt.load_as_of_version(0).to_pandas()   # version 0 = initial snapshot
+dt.load_as_version("2026-10-25T10:00:00Z")
+df = dt.to_pandas()
 ```
 
 ### Data Contracts (dbt schema.yml)
@@ -376,7 +340,7 @@ Project/
 ├── data_quality/               # Great Expectations
 │   ├── gx_setup.py             # Bootstrap GX context
 │   ├── run_checks.py           # Run checks + pipeline gate
-│   └── results/                # JSON results (read by dashboard)
+│   └── runtime_results/        # Local JSON reports read by the dashboard
 │
 ├── pipeline/
 │   ├── run_pipeline.py         # Master orchestrator

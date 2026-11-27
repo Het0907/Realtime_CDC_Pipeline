@@ -40,6 +40,7 @@ OUTPUT_DIR = args.output_dir
 consumer_kwargs = {
     "bootstrap_servers": args.bootstrap_server,
     "auto_offset_reset": "earliest",
+    "enable_auto_commit": False,
     "value_deserializer": lambda v: json.loads(v.decode("utf-8")) if v else None,
     "group_id": args.group_id,
 }
@@ -75,6 +76,7 @@ else:
 
 for message in consumer:
     if message.value is None:
+        consumer.commit()
         continue  # tombstone record from a delete, skip for now
 
     table = message.topic.split(".")[-1]
@@ -87,6 +89,8 @@ for message in consumer:
         "table": table,
         "operation": op,
         "timestamp_ms": ts_ms,
+        "partition": message.partition,
+        "offset": message.offset,
         "before": payload.get("before"),
         "after": payload.get("after"),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
@@ -101,10 +105,11 @@ for message in consumer:
     filepath = os.path.join(table_dir, filename)
 
     temp_filepath = f"{filepath}.{os.getpid()}.tmp"
-    with open(temp_filepath, "w") as f:
+    with open(temp_filepath, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
     os.replace(temp_filepath, filepath)
+    consumer.commit()
 
     print(f"[{table}] op={op} -> saved {filepath}")

@@ -1,23 +1,8 @@
-"""
-dashboard/app.py
-=================
-Next-Gen Modern UI Dashboard for the Real-Time CDC Lakehouse Platform.
-Architecture: Postgres (WAL) → Debezium → Kafka → Delta Lake → dbt (DuckDB) → Great Expectations
-
-Pages:
-  🏠 Overview        — Real-time health, Medallion flow widget, KPI metrics, operation analytics
-  📡 Live CDC Feed   — Event stream with search, operation filtering, & before/after state diff
-  👥 Customers       — Silver current state, Gold customer intelligence mart, CDC operations
-  📦 Orders          — Dual-axis sales velocity, enriched Gold order facts, & raw transactions
-  🏷️ Products       — Gold product leaderboard, category weights & catalog inventory
-  ✅ Data Quality    — Great Expectations automated quality gate, pass/fail audit cards
-  🔍 Time Travel     — Delta Lake historical version query, version diffing, & transaction log
-"""
+"""Streamlit dashboard for CDC activity, lakehouse data, and validation."""
 
 import json
-import os
 import sys
-from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 
 import duckdb
@@ -28,252 +13,43 @@ import streamlit as st
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent.parent
-BRONZE_DIR   = PROJECT_ROOT / "bronze_layer"
 SILVER_DIR   = PROJECT_ROOT / "silver"
 GOLD_DB      = PROJECT_ROOT / "gold" / "cdc_lakehouse.duckdb"
-GQ_RESULTS   = PROJECT_ROOT / "data_quality" / "results" / "gx_results_latest.json"
+GQ_RESULTS   = PROJECT_ROOT / "data_quality" / "runtime_results" / "gx_results_latest.json"
 
 sys.path.insert(0, str(PROJECT_ROOT))
+from silver_processor import TABLES, bronze_source, load_bronze_events as read_bronze_events
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="CDC Lakehouse | Real-Time Platform",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
-# ── Custom Modern CSS ──────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
-  /* Global typography & background */
-  html, body, [class*="css"] {
-    font-family: 'Plus Jakarta Sans', sans-serif;
-  }
-  
-  code, pre, .mono-font {
-    font-family: 'JetBrains Mono', monospace !important;
-  }
-
-  .stApp {
-    background: radial-gradient(circle at 15% 15%, #0f172a 0%, #090d16 50%, #030712 100%);
-    color: #f1f5f9;
-  }
-
-  /* Glassmorphism sidebar */
-  [data-testid="stSidebar"] {
-    background: linear-gradient(180deg, rgba(15, 23, 42, 0.95) 0%, rgba(3, 7, 18, 0.98) 100%);
-    border-right: 1px solid rgba(255, 255, 255, 0.08);
-    backdrop-filter: blur(16px);
-  }
-
-  /* Stat & KPI Cards */
-  .stat-card {
-    background: rgba(30, 41, 59, 0.5);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 16px;
-    padding: 20px 22px;
-    backdrop-filter: blur(12px);
-    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-    position: relative;
-    overflow: hidden;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  }
-  .stat-card:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 12px 40px 0 rgba(56, 189, 248, 0.15);
-    border-color: rgba(56, 189, 248, 0.3);
-  }
-  .stat-card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 3px;
-    background: linear-gradient(90deg, #38bdf8, #818cf8, #c084fc);
-  }
-  .stat-title {
-    font-size: 0.85rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: #94a3b8;
-    margin-bottom: 8px;
-  }
-  .stat-value {
-    font-size: 2.2rem;
-    font-weight: 800;
-    color: #ffffff;
-    line-height: 1.1;
-    letter-spacing: -0.02em;
-  }
-  .stat-subtext {
-    font-size: 0.8rem;
-    color: #64748b;
-    margin-top: 8px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  /* Live pulse badge */
-  .pulse-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    background: rgba(16, 185, 129, 0.12);
-    border: 1px solid rgba(16, 185, 129, 0.3);
-    color: #34d399;
-    padding: 4px 12px;
-    border-radius: 9999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-  }
-  .pulse-dot {
-    width: 8px;
-    height: 8px;
-    background-color: #10b981;
-    border-radius: 50%;
-    box-shadow: 0 0 10px #10b981;
-    animation: pulse 1.8s infinite;
-  }
-  @keyframes pulse {
-    0% { transform: scale(0.95); opacity: 0.7; }
-    50% { transform: scale(1.3); opacity: 1; }
-    100% { transform: scale(0.95); opacity: 0.7; }
-  }
-
-  /* Section headers */
-  .section-header-modern {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: linear-gradient(90deg, rgba(30, 58, 138, 0.25) 0%, rgba(15, 23, 42, 0) 100%);
-    border-left: 4px solid #38bdf8;
-    border-radius: 0 12px 12px 0;
-    padding: 12px 20px;
-    margin: 24px 0 16px 0;
-    font-weight: 700;
-    font-size: 1.15rem;
-    color: #f8fafc;
-  }
-
-  /* Operation Pills */
-  .pill-op {
-    padding: 3px 10px;
-    border-radius: 8px;
-    font-size: 0.75rem;
-    font-weight: 700;
-    letter-spacing: 0.03em;
-    display: inline-block;
-  }
-  .pill-c { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
-  .pill-u { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
-  .pill-d { background: rgba(244, 63, 94, 0.2); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.4); }
-  .pill-r { background: rgba(99, 102, 241, 0.2); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.4); }
-
-  /* Event feed cards */
-  .event-card {
-    background: rgba(30, 41, 59, 0.4);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 12px;
-    padding: 14px 18px;
-    margin-bottom: 10px;
-    transition: all 0.2s ease;
-  }
-  .event-card:hover {
-    background: rgba(30, 41, 59, 0.7);
-    border-color: rgba(56, 189, 248, 0.4);
-  }
-
-  /* Modern Tab styling */
-  .stTabs [data-baseweb="tab-list"] {
-    background: rgba(15, 23, 42, 0.7);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 12px;
-    padding: 6px;
-    gap: 8px;
-  }
-  .stTabs [data-baseweb="tab"] {
-    border-radius: 8px;
-    color: #94a3b8;
-    font-weight: 600;
-    padding: 8px 16px;
-  }
-  .stTabs [aria-selected="true"] {
-    background: linear-gradient(135deg, #0284c7 0%, #4f46e5 100%) !important;
-    color: #ffffff !important;
-    box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4);
-  }
-
-  /* Medallion Pipeline Graphic Box */
-  .pipeline-grid {
-    display: grid;
-    grid-template-columns: repeat(6, 1fr);
-    gap: 12px;
-    background: rgba(15, 23, 42, 0.6);
-    border: 1px solid rgba(56, 189, 248, 0.2);
-    border-radius: 18px;
-    padding: 22px 18px;
-    backdrop-filter: blur(12px);
-    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
-    margin-bottom: 24px;
-  }
-  .stage-box {
-    background: rgba(30, 41, 59, 0.6);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 14px;
-    padding: 16px 12px;
-    text-align: center;
-    position: relative;
-    transition: transform 0.2s ease;
-  }
-  .stage-box:hover {
-    transform: translateY(-2px);
-    border-color: #38bdf8;
-  }
-  .stage-icon { font-size: 1.8rem; margin-bottom: 6px; }
-  .stage-title { font-weight: 700; font-size: 0.88rem; color: #f8fafc; }
-  .stage-sub { font-size: 0.72rem; color: #94a3b8; margin-top: 4px; }
-  .stage-badge {
-    margin-top: 8px;
-    font-size: 0.68rem;
-    padding: 2px 8px;
-    border-radius: 6px;
-    font-weight: 600;
-  }
-</style>
-""", unsafe_allow_html=True)
+st.markdown(f"<style>{Path(__file__).with_name('styles.css').read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 
 
 # ── Data Loaders & Caching ─────────────────────────────────────────────────────
 
 @st.cache_data(ttl=20)
-def load_bronze_events(table: str) -> pd.DataFrame:
-    table_dir = BRONZE_DIR / table
+def load_bronze_events(table: str, source: str) -> pd.DataFrame:
     rows = []
-    if not table_dir.exists():
-        return pd.DataFrame()
-    for f in sorted(table_dir.glob("*.json")):
-        try:
-            with open(f, encoding="utf-8") as fp:
-                ev = json.load(fp)
-            row_data = ev.get("after") or ev.get("before") or {}
-            rows.append({
-                "table":        table,
-                "operation":    ev.get("operation", "?"),
-                "timestamp_ms": ev.get("timestamp_ms", 0),
-                "ingested_at":  ev.get("ingested_at", ""),
-                "id":           row_data.get("id"),
-                "before":       ev.get("before"),
-                "after":        ev.get("after"),
-                "filename":     f.name,
-            })
-        except Exception:
-            continue
+    for event in read_bronze_events(table, source):
+        row_data = event.get("after") or event.get("before") or {}
+        rows.append({
+            "table": table,
+            "operation": event.get("operation", "?"),
+            "timestamp_ms": event.get("timestamp_ms", 0),
+            "partition": event.get("partition"),
+            "offset": event.get("offset"),
+            "ingested_at": event.get("ingested_at", ""),
+            "id": row_data.get("id"),
+            "before": event.get("before"),
+            "after": event.get("after"),
+            "location": event["location"],
+        })
     df = pd.DataFrame(rows)
     if not df.empty:
         df["event_time"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
@@ -281,8 +57,8 @@ def load_bronze_events(table: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=20)
-def load_all_bronze_events() -> pd.DataFrame:
-    frames = [load_bronze_events(t) for t in ["customers", "orders", "products"]]
+def load_all_bronze_events(source: str) -> pd.DataFrame:
+    frames = [load_bronze_events(table, source) for table in TABLES]
     valid = [f for f in frames if not f.empty]
     return pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
 
@@ -338,397 +114,260 @@ def load_silver_as_of_version(table: str, version: int) -> pd.DataFrame:
         return pd.DataFrame({"error": [str(e)]})
 
 
-# ── Sidebar Navigation ─────────────────────────────────────────────────────────
+OPERATIONS = {
+    "c": ("Insert", "#70e4c2"),
+    "u": ("Update", "#efb86a"),
+    "d": ("Delete", "#ff8d99"),
+    "r": ("Snapshot", "#a9a4fa"),
+}
+OTHER_OPERATION = ("Other", "#98abc1")
+
+
+def format_utc(value, fmt="%d %b %Y · %H:%M UTC"):
+    unit = "ms" if isinstance(value, (int, float)) else None
+    timestamp = pd.to_datetime(value, unit=unit, utc=True, errors="coerce")
+    return timestamp.strftime(fmt) if pd.notna(timestamp) else "—"
+
+
+def record_id(value):
+    return "—" if pd.isna(value) else str(value).removesuffix(".0")
+
+
+def page_heading(title, description):
+    st.markdown(f"""
+<div class="page-heading"><h1>{title}</h1><p>{description}</p></div>
+""", unsafe_allow_html=True)
+
+
+def panel_heading(title, description):
+    st.markdown(f"""
+<div class="panel-heading"><h2>{title}</h2><p>{description}</p></div>
+""", unsafe_allow_html=True)
+
+
+def stat_card_markup(title, value, detail, status=""):
+    return f"""
+<div class="stat-card">
+    <div class="stat-title">{title}</div>
+    <div class="stat-value {status}">{value}</div>
+    <div class="stat-subtext">{detail}</div>
+</div>
+"""
+
+
+def recent_first(events):
+    return events.sort_values(["timestamp_ms", "partition", "offset"], ascending=False, kind="stable")
+
 
 def render_sidebar():
     with st.sidebar:
         st.markdown("""
-        <div style="text-align:center; padding: 16px 0 12px 0;">
-            <div style="font-size: 2.4rem; filter: drop-shadow(0 0 16px #38bdf8);">⚡</div>
-            <div style="font-size: 1.35rem; font-weight: 800; background: linear-gradient(90deg, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">CDC Lakehouse</div>
-            <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px; font-weight: 500;">Real-Time Data Platform</div>
-            <div style="margin-top: 10px;">
-                <span class="pulse-badge"><span class="pulse-dot"></span> Pipeline Active</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-
+<div class="site-brand"><span class="site-mark" aria-hidden="true">≈</span><strong>CDC Lakehouse</strong></div>
+""", unsafe_allow_html=True)
         page = st.radio(
-            "Navigation",
-            options=[
-                "🏠 Overview",
-                "📡 Live CDC Feed",
-                "👥 Customers",
-                "📦 Orders",
-                "🏷️ Products",
-                "✅ Data Quality",
-                "🔍 Time Travel",
-            ],
-            label_visibility="collapsed",
+            "Pages",
+            ["Overview", "CDC Feed", "Customers", "Orders", "Products", "Data Quality", "Time Travel"],
         )
-
-        st.markdown("---")
-
-        # System Health Card
-        gq = load_gq_results()
-        if gq:
-            all_pass = all(v.get("failed", 0) == 0 for v in gq.get("tables", {}).values())
-            color = "#10b981" if all_pass else "#f43f5e"
-            status_text = "All Contracts Passing" if all_pass else "Violations Detected"
-            ts = gq.get("run_timestamp", "")[:19].replace("T", " ")
-            st.markdown(f"""
-            <div style="background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 12px 14px; border-left: 4px solid {color};">
-                <div style="font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; font-weight: 700;">Data Quality Gate</div>
-                <div style="color: {color}; font-size: 0.88rem; font-weight: 700; margin-top: 2px;">{status_text}</div>
-                <div style="font-size: 0.72rem; color: #64748b; margin-top: 4px;">Audited: {ts} UTC</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
-
-        # Refresh Action
-        if st.button("🔄 Refresh Cache", use_container_width=True):
+        source_label = "Spark Delta" if bronze_source() == "spark" else "Kafka JSON"
+        st.markdown(f"""
+<div class="sidebar-status">
+    <span>Bronze source</span>
+    <strong>{source_label}</strong>
+</div>
+""", unsafe_allow_html=True)
+        if st.button("Refresh data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
-
-        st.markdown("""
-        <div style="margin-top: 24px; font-size: 0.72rem; color: #475569; text-align: center; line-height: 1.6;">
-            <strong>Stack:</strong> Postgres WAL • Debezium<br/>
-            Kafka • Delta Lake • dbt • DuckDB
-        </div>
-        """, unsafe_allow_html=True)
-
     return page
 
 
-# ── Page: Overview ─────────────────────────────────────────────────────────────
-
 def page_overview():
-    # Hero Title with Quick Badges
-    st.markdown("""
-    <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-bottom: 20px;">
-        <div>
-            <h1 style="margin:0; font-size: 2.2rem; font-weight: 800; letter-spacing: -0.02em;">⚡ CDC Lakehouse Platform</h1>
-            <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
-                Continuous row-level replication from PostgreSQL WAL to Delta Lake ACID tables & dbt Gold Marts
-            </p>
-        </div>
-        <div>
-            <span class="pulse-badge"><span class="pulse-dot"></span> Streaming Ingestion</span>
-        </div>
+    source = bronze_source()
+    events = load_all_bronze_events(source)
+    latest_capture = pd.to_datetime(events.get("ingested_at", pd.Series(dtype=str)), utc=True, errors="coerce", format="mixed").max()
+    st.markdown(f"""
+<div class="overview-hero">
+    <div>
+        <h1>CDC Lakehouse</h1>
+        <p>Follow PostgreSQL changes from Kafka to Delta Lake and dbt.</p>
     </div>
-    """, unsafe_allow_html=True)
-
-    # Medallion Architecture Pipeline Flow Widget
-    st.markdown("""
-    <div class="pipeline-grid">
-        <div class="stage-box">
-            <div class="stage-icon">🐘</div>
-            <div class="stage-title">Postgres</div>
-            <div class="stage-sub">OLTP WAL Log</div>
-            <div class="stage-badge" style="background:rgba(56,189,248,0.2); color:#38bdf8;">Logical Repl</div>
-        </div>
-        <div class="stage-box">
-            <div class="stage-icon">⚡</div>
-            <div class="stage-title">Debezium</div>
-            <div class="stage-sub">Kafka Connect</div>
-            <div class="stage-badge" style="background:rgba(129,140,248,0.2); color:#818cf8;">Sub-sec CDC</div>
-        </div>
-        <div class="stage-box">
-            <div class="stage-icon">📨</div>
-            <div class="stage-title">Kafka</div>
-            <div class="stage-sub">Event Backbone</div>
-            <div class="stage-badge" style="background:rgba(192,132,252,0.2); color:#c084fc;">3 Topics</div>
-        </div>
-        <div class="stage-box">
-            <div class="stage-icon">🥉</div>
-            <div class="stage-title">Bronze</div>
-            <div class="stage-sub">Raw Ingestion</div>
-            <div class="stage-badge" style="background:rgba(251,146,60,0.2); color:#fb923c;">Immutable</div>
-        </div>
-        <div class="stage-box">
-            <div class="stage-icon">🥈</div>
-            <div class="stage-title">Silver</div>
-            <div class="stage-sub">Delta Lake ACID</div>
-            <div class="stage-badge" style="background:rgba(52,211,153,0.2); color:#34d399;">MERGE / Upsert</div>
-        </div>
-        <div class="stage-box">
-            <div class="stage-icon">🥇</div>
-            <div class="stage-title">Gold</div>
-            <div class="stage-sub">dbt + DuckDB</div>
-            <div class="stage-badge" style="background:rgba(250,204,21,0.2); color:#facc15;">Marts & Views</div>
-        </div>
+    <div class="hero-freshness">
+        <span>Latest Bronze capture</span>
+        <strong>{format_utc(latest_capture)}</strong>
     </div>
-    """, unsafe_allow_html=True)
+</div>
+""", unsafe_allow_html=True)
 
-    # Live Data Load
-    all_events = load_all_bronze_events()
-    c_events   = load_bronze_events("customers")
-    o_events   = load_bronze_events("orders")
-    p_events   = load_bronze_events("products")
+    audits = load_gq_results().get("tables", {})
+    failed = sum(table.get("failed", 0) for table in audits.values())
+    passed = sum(table.get("passed", 0) for table in audits.values())
+    if passed + failed:
+        quality_value = "Blocked" if failed else "Passed"
+        quality_detail = f"{passed}/{passed + failed} checks passed"
+        quality_status = "is-fail" if failed else "is-pass"
+    else:
+        quality_value, quality_detail, quality_status = "Pending", "No completed audit", ""
 
-    df_cust = load_silver_table("customers")
-    df_ord  = load_silver_table("orders")
-    df_prod = load_silver_table("products")
-    gq      = load_gq_results()
+    metrics = [
+        ("Bronze events", f"{len(events):,}", "Captured CDC records", ""),
+        ("Active customers", f"{active_row_count(load_silver_table('customers')):,}", "Silver Delta", ""),
+        ("Active orders", f"{active_row_count(load_silver_table('orders')):,}", "Silver Delta", ""),
+        ("Quality gate", quality_value, quality_detail, quality_status),
+    ]
+    cards = "".join(stat_card_markup(*metric) for metric in metrics)
+    st.markdown(f'<div class="overview-metrics">{cards}</div>', unsafe_allow_html=True)
 
-    active_customers = len(df_cust[df_cust["_is_deleted"] == False]) if not df_cust.empty and "_is_deleted" in df_cust.columns else len(df_cust)
-    total_orders = len(df_ord[df_ord["_is_deleted"] == False]) if not df_ord.empty and "_is_deleted" in df_ord.columns else len(df_ord)
-
-    # 4 Stat Cards
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-title">Captured CDC Events</div>
-            <div class="stat-value">{len(all_events):,}</div>
-            <div class="stat-subtext">📥 Append-only Bronze events</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-title">Active Silver Customers</div>
-            <div class="stat-value">{active_customers:,}</div>
-            <div class="stat-subtext">👤 Deduplicated via MERGE</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-title">Processed Orders</div>
-            <div class="stat-value">{total_orders:,}</div>
-            <div class="stat-subtext">📦 Real-time transaction state</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with c4:
-        if gq:
-            failed = sum(v.get("failed", 0) for v in gq.get("tables", {}).values())
-            passed = sum(v.get("passed", 0) for v in gq.get("tables", {}).values())
-            pass_rate = int((passed / (passed + failed)) * 100) if (passed + failed) > 0 else 100
-            val_text = f"{pass_rate}%"
-            sub_text = "🛡️ 0 violations detected" if failed == 0 else f"⚠️ {failed} violations"
+    chart_column, recent_column = st.columns([1.35, 1])
+    with chart_column, st.container(border=True):
+        panel_heading("CDC activity", "Captured events by table and operation")
+        if events.empty:
+            st.info("Waiting for Bronze events.")
         else:
-            val_text = "100%"
-            sub_text = "🛡️ Initializing gate"
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-title">Data Quality Gate</div>
-            <div class="stat-value" style="color: #34d399;">{val_text}</div>
-            <div class="stat-subtext">{sub_text}</div>
-        </div>
-        """, unsafe_allow_html=True)
+            render_activity_chart(events)
 
-    st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
+    with recent_column, st.container(border=True):
+        panel_heading("Recent changes", "Most recent CDC events · UTC")
+        if events.empty:
+            st.info("New events will appear here as they are captured.")
+        else:
+            rows = []
+            for event in recent_first(events).head(5).itertuples():
+                op, _ = OPERATIONS.get(event.operation, OTHER_OPERATION)
+                style = event.operation if event.operation in OPERATIONS else "other"
+                rows.append(f"""
+<div class="recent-event">
+    <span class="pill-op pill-{style}">{op}</span>
+    <strong>{escape(event.table.title())} · {escape(record_id(event.id))}</strong>
+    <time>{format_utc(event.event_time, "%H:%M:%S")}</time>
+</div>""")
+            st.markdown("".join(rows), unsafe_allow_html=True)
 
-    # Visual Analytics Row
-    if not all_events.empty:
-        col_left, col_right = st.columns([1, 1])
+    render_pipeline_flow(source)
 
-        with col_left:
-            st.markdown('<div class="section-header-modern"><span>📊 Operations Distribution</span><span style="font-size:0.8rem; color:#94a3b8;">INSERT • UPDATE • DELETE</span></div>', unsafe_allow_html=True)
-            op_map = {"c": "INSERT", "u": "UPDATE", "d": "DELETE", "r": "SNAPSHOT"}
-            all_events["op_name"] = all_events["operation"].map(op_map).fillna("OTHER")
-            op_df = all_events["op_name"].value_counts().reset_index()
-            op_df.columns = ["Operation", "Count"]
 
-            fig_donut = px.pie(
-                op_df, values="Count", names="Operation",
-                hole=0.6,
-                color="Operation",
-                color_discrete_map={
-                    "INSERT": "#10b981",
-                    "UPDATE": "#f59e0b",
-                    "DELETE": "#f43f5e",
-                    "SNAPSHOT": "#6366f1",
-                    "OTHER": "#94a3b8"
-                },
-                template="plotly_dark"
+def active_row_count(frame):
+    if "_is_deleted" not in frame.columns:
+        return len(frame)
+    return int(frame["_is_deleted"].eq(False).sum())
+
+
+def render_activity_chart(events):
+    chart = go.Figure()
+    names = [table.title() for table in TABLES]
+    operations = events["operation"].where(events["operation"].isin(OPERATIONS), "other")
+    counts = events.groupby(["table", operations.rename("op")]).size()
+    for op, (label, color) in {**OPERATIONS, "other": OTHER_OPERATION}.items():
+        values = [int(counts.get((table, op), 0)) for table in TABLES]
+        if any(values):
+            chart.add_bar(
+                x=values, y=names, name=label, orientation="h",
+                marker_color=color, hovertemplate="%{y}: %{x} events<extra>%{fullData.name}</extra>",
             )
-            fig_donut.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="Plus Jakarta Sans", color="#94a3b8"),
-                margin=dict(l=10, r=10, t=10, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5)
-            )
-            st.plotly_chart(fig_donut, use_container_width=True)
-
-        with col_right:
-            st.markdown('<div class="section-header-modern"><span>📈 Events by Entity Table</span><span style="font-size:0.8rem; color:#94a3b8;">Customers • Orders • Products</span></div>', unsafe_allow_html=True)
-            tbl_df = all_events.groupby(["table", "op_name"]).size().reset_index(name="Count")
-            fig_bar = px.bar(
-                tbl_df, x="table", y="Count", color="op_name",
-                barmode="stack",
-                color_discrete_map={
-                    "INSERT": "#10b981",
-                    "UPDATE": "#f59e0b",
-                    "DELETE": "#f43f5e",
-                    "SNAPSHOT": "#6366f1"
-                },
-                template="plotly_dark"
-            )
-            fig_bar.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="Plus Jakarta Sans", color="#94a3b8"),
-                margin=dict(l=10, r=10, t=10, b=10),
-                legend_title_text="",
-                xaxis_title="",
-                yaxis_title="Total Events",
-                legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5)
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-    # Lakehouse Storage & Integrity Summary
-    st.markdown('<div class="section-header-modern"><span>🗄️ Medallion Storage Breakdown</span><span style="font-size:0.8rem; color:#38bdf8;">Delta Lake ACID + DuckDB</span></div>', unsafe_allow_html=True)
-    m1, m2, m3 = st.columns(3)
-    
-    with m1:
-        st.markdown("""
-        <div style="background: rgba(30,41,59,0.4); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px;">
-            <div style="font-weight:700; color:#fb923c; margin-bottom:8px;">🥉 Bronze Ingestion Layer</div>
-            <div style="font-size:0.85rem; color:#cbd5e1; line-height:1.7;">
-                • Format: <strong>Raw JSON & Spark Delta</strong><br/>
-                • Storage: <code>bronze_layer/</code><br/>
-                • Strategy: Append-Only Immutable<br/>
-                • Ordering: Partition + Kafka Offset
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    with m2:
-        st.markdown("""
-        <div style="background: rgba(30,41,59,0.4); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px;">
-            <div style="font-weight:700; color:#34d399; margin-bottom:8px;">🥈 Silver Conformed Layer</div>
-            <div style="font-size:0.85rem; color:#cbd5e1; line-height:1.7;">
-                • Format: <strong>Delta Lake Parquet</strong><br/>
-                • Storage: <code>silver/</code><br/>
-                • Upsert: Idempotent <code>MERGE</code> on PK<br/>
-                • Deletes: Soft delete flag (<code>_is_deleted</code>)
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    with m3:
-        st.markdown("""
-        <div style="background: rgba(30,41,59,0.4); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px;">
-            <div style="font-weight:700; color:#facc15; margin-bottom:8px;">🥇 Gold Dimensional Layer</div>
-            <div style="font-size:0.85rem; color:#cbd5e1; line-height:1.7;">
-                • Engine: <strong>dbt Core + DuckDB</strong><br/>
-                • Storage: <code>gold/cdc_lakehouse.duckdb</code><br/>
-                • Marts: Wide Enriched Facts & Summaries<br/>
-                • Governance: Tested with Great Expectations
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    chart.update_layout(
+        barmode="stack", height=218, bargap=.48,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#b2c4d6", "size": 12},
+        margin={"l": 0, "r": 8, "t": 8, "b": 5},
+        xaxis={"gridcolor": "#2b3b4e", "zeroline": False, "rangemode": "tozero", "dtick": 1 if counts.max() < 5 else None},
+        yaxis={"autorange": "reversed", "showgrid": False, "automargin": True,
+               "ticks": "outside", "ticklen": 7, "tickcolor": "#101721"},
+        legend={"orientation": "h", "y": -0.2, "x": 0, "font": {"size": 11}, "traceorder": "normal"},
+    )
+    st.plotly_chart(chart, use_container_width=True, theme=None, config={"displayModeBar": False})
 
 
-# ── Page: Live CDC Feed ────────────────────────────────────────────────────────
+def render_pipeline_flow(source):
+    st.subheader("Pipeline flow")
+    steps = [
+        ("PostgreSQL", "Write-ahead log", "#81b8f5"),
+        ("Debezium → Kafka", "Change capture", "#a9a4fa"),
+        ("Bronze", "Spark Structured Streaming" if source == "spark" else "Kafka JSON consumer", "#efb86a"),
+        ("Silver", "Airflow · Delta upserts", "#a9bccd"),
+        ("Quality gate", "Great Expectations", "#70e4c2"),
+        ("Gold", "dbt · DuckDB marts", "#f2d789"),
+    ]
+    cards = "".join(
+        f'<div class="pipeline-step" style="--step:{color}"><strong>{name}</strong><span>{detail}</span></div>'
+        for name, detail, color in steps
+    )
+    st.markdown(f'<div class="pipeline-flow">{cards}</div>', unsafe_allow_html=True)
+
 
 def page_cdc_feed():
-    st.markdown("""
-    <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-bottom: 20px;">
-        <div>
-            <h1 style="margin:0; font-size: 2.1rem; font-weight: 800;">📡 Live CDC Event Stream</h1>
-            <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
-                Streaming audit feed captured directly from PostgreSQL logical replication
-            </p>
-        </div>
-        <div>
-            <span class="pulse-badge"><span class="pulse-dot"></span> Live Log Tail</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    all_events = load_all_bronze_events()
-    if all_events.empty:
-        st.info("No bronze events captured yet. Run `python simulate_event.py --insert` or `consumer.py`.")
+    page_heading("CDC Feed", "Filter captured events and inspect the row before and after a change.")
+    events = load_all_bronze_events(bronze_source())
+    if events.empty:
+        st.info("The selected Bronze source has no events yet.")
         return
 
-    # Filter Controls
-    c1, c2, c3 = st.columns([1.5, 2, 2.5])
-    with c1:
-        tables = st.multiselect("Table Filter", ["customers", "orders", "products"], default=["customers", "orders", "products"])
-    with c2:
-        ops = st.multiselect("Operation Filter", ["c (INSERT)", "u (UPDATE)", "d (DELETE)", "r (SNAPSHOT)"],
-                            default=["c (INSERT)", "u (UPDATE)", "d (DELETE)", "r (SNAPSHOT)"])
-    with c3:
-        search = st.text_input("🔍 Search Record ID or Content", placeholder="e.g. 1001, alice, gadget...")
+    table_filter, op_filter, search_filter = st.columns([1, 1, 1.1])
+    with table_filter:
+        tables = st.multiselect("Tables", TABLES, format_func=str.title, placeholder="All tables")
+    with op_filter:
+        operation_labels = {code: label for code, (label, _) in OPERATIONS.items()}
+        selected_ops = st.multiselect(
+            "Operations", list(operation_labels), format_func=operation_labels.get,
+            placeholder="All operations",
+        )
+    with search_filter:
+        search = st.text_input("Search record or payload", placeholder="Record ID or field value").strip()
 
-    op_map_rev = {"c (INSERT)": "c", "u (UPDATE)": "u", "d (DELETE)": "d", "r (SNAPSHOT)": "r"}
-    selected_ops = [op_map_rev[o] for o in ops]
+    filtered = events.loc[
+        events["table"].isin(tables or TABLES) & events["operation"].isin(selected_ops or operation_labels)
+    ]
+    if search:
+        matches = pd.Series(False, index=filtered.index)
+        for field in ("id", "before", "after"):
+            matches |= filtered[field].astype(str).str.contains(search, case=False, regex=False)
+        filtered = filtered.loc[matches]
 
-    filtered = all_events[
-        all_events["table"].isin(tables) & all_events["operation"].isin(selected_ops)
-    ].sort_values("timestamp_ms", ascending=False)
+    filtered = recent_first(filtered).reset_index(drop=True)
+    if filtered.empty:
+        st.info("No events match the selected filters.")
+        return
 
-    if search.strip():
-        s = search.strip().lower()
-        filtered = filtered[
-            filtered["id"].astype(str).str.lower().str.contains(s) |
-            filtered["before"].astype(str).str.lower().str.contains(s) |
-            filtered["after"].astype(str).str.lower().str.contains(s)
+    list_column, inspector_column = st.columns([1.05, 1])
+    with list_column, st.container(border=True):
+        panel_heading("Matching events", f"{len(filtered):,} events · newest first")
+        preview = pd.DataFrame({
+            "Operation": filtered["operation"].map(operation_labels),
+            "Table": filtered["table"].str.title(),
+            "Record": filtered["id"].map(record_id),
+            "Time (UTC)": filtered["event_time"].dt.strftime("%d %b %H:%M"),
+        })
+        st.dataframe(preview, hide_index=True, use_container_width=True, height=405)
+
+    with inspector_column, st.container(border=True):
+        panel_heading("Event inspector", "Choose an event to see the captured payload.")
+        labels = [
+            f"{operation_labels[row.operation]} · {row.table.title()} #{record_id(row.id)} · {format_utc(row.event_time, '%H:%M:%S')}"
+            for row in filtered.itertuples()
         ]
+        selected = st.selectbox("Event", range(len(filtered)), format_func=labels.__getitem__)
+        event = filtered.iloc[selected]
+        st.markdown(f'<div class="record-location">{escape(str(event["location"]))}</div>', unsafe_allow_html=True)
+        before_tab, after_tab = st.tabs(["Before", "After"])
+        with before_tab:
+            render_event_state(event["before"], "No previous row in this event.")
+        with after_tab:
+            render_event_state(event["after"], "No resulting row in this event.")
 
-    st.markdown(f"<div style='color:#94a3b8; font-size:0.85rem; margin: 12px 0;'>Showing <strong>{len(filtered)}</strong> matching CDC events</div>", unsafe_allow_html=True)
 
-    pill_styles = {
-        "c": '<span class="pill-op pill-c">🟢 INSERT</span>',
-        "u": '<span class="pill-op pill-u">🟡 UPDATE</span>',
-        "d": '<span class="pill-op pill-d">🔴 DELETE</span>',
-        "r": '<span class="pill-op pill-r">🟣 SNAPSHOT</span>',
-    }
-
-    # Render events with expandable diffs
-    for _, row in filtered.head(50).iterrows():
-        op = row["operation"]
-        op_pill = pill_styles.get(op, f'<span class="pill-op">{op}</span>')
-        ts = str(row.get("event_time", ""))[:19]
-        rec_id = row.get("id", "?")
-        tbl = row["table"]
-
-        with st.container():
-            st.markdown(f"""
-            <div class="event-card">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <div style="display:flex; align-items:center; gap: 12px;">
-                        {op_pill}
-                        <span style="font-weight:700; color:#f8fafc; font-size:1rem;">{tbl}</span>
-                        <span style="color:#64748b; font-size:0.85rem; font-family:'JetBrains Mono';">ID: {rec_id}</span>
-                    </div>
-                    <div style="color:#64748b; font-size:0.8rem; font-family:'JetBrains Mono';">
-                        ⏱️ {ts} UTC
-                    </div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            with st.expander(f"Inspect Payload & State Diff (ID: {rec_id})"):
-                d1, d2 = st.columns(2)
-                with d1:
-                    st.caption("State Before Change (`before`):")
-                    st.json(row["before"] if row["before"] is not None else {"status": "None (New Record)"})
-                with d2:
-                    st.caption("State After Change (`after`):")
-                    st.json(row["after"] if row["after"] is not None else {"status": "None (Deleted Record)"})
+def render_event_state(payload, empty_text):
+    if payload is None:
+        st.caption(empty_text)
+    else:
+        st.json(payload)
 
 
 # ── Page: Customers ────────────────────────────────────────────────────────────
 
 def page_customers():
-    st.markdown("""
-    <div style="margin-bottom: 20px;">
-        <h1 style="margin:0; font-size: 2.1rem; font-weight: 800;">👥 Customer Analytics</h1>
-        <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
-            Silver Conformed Delta Table combined with Gold Dimensional Customer Mart
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    page_heading("Customers", "Active customer records in Silver and order segments from dbt.")
 
     df_silver = load_silver_table("customers")
     df_gold   = load_gold_mart("customer_order_summary")
-    bronze    = load_bronze_events("customers")
+    bronze    = load_bronze_events("customers", bronze_source())
 
     if df_silver.empty:
         st.warning("Silver customers table not found. Run `python silver_processor.py`.")
@@ -806,8 +445,8 @@ def page_customers():
             st.markdown('<div class="section-header-modern"><span>📜 Historical Bronze Ingestion Feed</span></div>', unsafe_allow_html=True)
             hist = bronze.sort_values("timestamp_ms", ascending=False)
             st.dataframe(
-                hist[["operation", "id", "event_time", "filename"]].rename(columns={
-                    "operation": "Op", "id": "Customer ID", "event_time": "Time (UTC)", "filename": "Bronze Source File"
+                hist[["operation", "id", "event_time", "location"]].rename(columns={
+                    "operation": "Op", "id": "Customer ID", "event_time": "Time (UTC)", "location": "Bronze Record"
                 }),
                 use_container_width=True,
                 hide_index=True
@@ -817,14 +456,7 @@ def page_customers():
 # ── Page: Orders ───────────────────────────────────────────────────────────────
 
 def page_orders():
-    st.markdown("""
-    <div style="margin-bottom: 20px;">
-        <h1 style="margin:0; font-size: 2.1rem; font-weight: 800;">📦 Orders & Sales Velocity</h1>
-        <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
-            Real-time transaction log merged into Delta Lake and joined in dbt Gold Fact Marts
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    page_heading("Orders", "Daily order volume, units sold, and enriched order records.")
 
     df_orders = load_silver_table("orders")
     df_gold_orders = load_gold_mart("orders_with_customers")
@@ -893,7 +525,7 @@ def page_orders():
             template="plotly_dark",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="Plus Jakarta Sans", color="#94a3b8"),
+            font=dict(family="sans-serif", color="#94a3b8"),
             legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
             margin=dict(l=20, r=20, t=20, b=20),
         )
@@ -913,14 +545,7 @@ def page_orders():
 # ── Page: Products ─────────────────────────────────────────────────────────────
 
 def page_products():
-    st.markdown("""
-    <div style="margin-bottom: 20px;">
-        <h1 style="margin:0; font-size: 2.1rem; font-weight: 800;">🏷️ Product Intelligence</h1>
-        <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
-            Product dimensions, Gold sales leaderboard, and weight logistics
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    page_heading("Products", "Catalog coverage, item weights, and product sales rankings.")
 
     df_products = load_silver_table("products")
     df_gold_prod = load_gold_mart("product_sales_summary")
@@ -954,7 +579,7 @@ def page_products():
         st.markdown(f"""
         <div class="stat-card">
             <div class="stat-title">Top Selling SKU</div>
-            <div class="stat-value" style="font-size: 1.4rem; color:#facc15;">{top_seller}</div>
+            <div class="stat-value" style="font-size: 1.4rem; color:#facc15;">{escape(str(top_seller))}</div>
             <div class="stat-subtext">🥇 Ranked #1 by dbt mart</div>
         </div>
         """, unsafe_allow_html=True)
@@ -1000,7 +625,7 @@ def page_products():
                 )
                 fig_bar.update_layout(
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Plus Jakarta Sans", color="#94a3b8"),
+                    font=dict(family="sans-serif", color="#94a3b8"),
                     margin=dict(l=0, r=0, t=10, b=0),
                     showlegend=False,
                 )
@@ -1010,180 +635,117 @@ def page_products():
 # ── Page: Data Quality ─────────────────────────────────────────────────────────
 
 def page_data_quality():
-    st.markdown("""
-    <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-bottom: 20px;">
-        <div>
-            <h1 style="margin:0; font-size: 2.1rem; font-weight: 800;">✅ Automated Quality Gate</h1>
-            <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
-                Great Expectations assertion checks on Silver Delta tables. Pipeline halts on any contract violation.
-            </p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    gq = load_gq_results()
-    if not gq:
-        st.info("No GX quality results found. Run `python data_quality/run_checks.py`.")
+    page_heading("Data Quality", "Great Expectations checks the Silver tables before dbt runs.")
+    audit = load_gq_results()
+    results = audit.get("tables", {})
+    if not results:
+        st.info("No quality audit has completed yet.")
         return
 
-    ts = gq.get("run_timestamp", "")[:19].replace("T", " ")
-    all_pass = all(v.get("failed", 0) == 0 for v in gq.get("tables", {}).values())
+    passed = sum(result.get("passed", 0) for result in results.values())
+    failed = sum(result.get("failed", 0) for result in results.values())
+    if failed:
+        gate = ("Quality gate", "Blocked", f"{failed:,} checks failed", "is-fail")
+    else:
+        gate = ("Quality gate", "Passed", "No violations detected", "is-pass")
+    metrics = [
+        gate,
+        ("Checks passed", f"{passed:,} / {passed + failed:,}", f"Across {len(results)} Silver tables"),
+        ("Last audit", format_utc(audit.get("run_timestamp"), "%H:%M UTC"), format_utc(audit.get("run_timestamp"), "%d %b %Y")),
+    ]
+    cards = "".join(stat_card_markup(*metric) for metric in metrics)
+    st.markdown(f'<div class="overview-metrics snapshot-metrics">{cards}</div>', unsafe_allow_html=True)
 
-    total_checks = sum(v.get("passed", 0) + v.get("failed", 0) for v in gq.get("tables", {}).values())
-    total_passed = sum(v.get("passed", 0) for v in gq.get("tables", {}).values())
-    total_failed = sum(v.get("failed", 0) for v in gq.get("tables", {}).values())
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-title">Total Assertions</div>
-            <div class="stat-value">{total_checks}</div>
-            <div class="stat-subtext">🔍 Column & row contract rules</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-title">Passed Checks</div>
-            <div class="stat-value" style="color:#10b981;">{total_passed}</div>
-            <div class="stat-subtext">🛡️ Clean conformed data</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with c3:
-        failed_color = "#f43f5e" if total_failed > 0 else "#10b981"
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-title">Violations Detected</div>
-            <div class="stat-value" style="color:{failed_color};">{total_failed}</div>
-            <div class="stat-subtext">{"⚠️ Gate halted" if total_failed > 0 else "✓ Zero contract breaches"}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
-
-    # Detailed Table Cards
-    for table_name, result in gq.get("tables", {}).items():
-        passed_ct = result.get("passed", 0)
-        failed_ct = result.get("failed", 0)
-        tbl_pass  = failed_ct == 0
-        accent    = "#10b981" if tbl_pass else "#f43f5e"
-        badge_html = f'<span style="background:rgba(16,185,129,0.2); color:#34d399; padding:4px 12px; border-radius:9999px; font-size:0.75rem; font-weight:700;">✓ 100% PASS</span>' if tbl_pass else f'<span style="background:rgba(244,63,94,0.2); color:#fb7185; padding:4px 12px; border-radius:9999px; font-size:0.75rem; font-weight:700;">✗ {failed_ct} FAIL</span>'
-
-        st.markdown(f"""
-        <div style="background: rgba(30,41,59,0.5); border: 1px solid rgba(255,255,255,0.06); border-radius: 14px; border-left: 4px solid {accent}; padding: 18px 22px; margin-bottom: 16px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
-                <div style="display:flex; align-items:center; gap:10px;">
-                    <span style="font-size:1.15rem; font-weight:700; color:#ffffff;">{table_name.capitalize()} Expectations Suite</span>
-                    <span style="color:#64748b; font-size:0.85rem;">({passed_ct} / {passed_ct + failed_ct} checks passed)</span>
-                </div>
-                {badge_html}
-            </div>
-        """, unsafe_allow_html=True)
-
-        for chk in result.get("checks", []):
-            passed = chk.get("passed", False)
-            icon = "✓" if passed else "✗"
-            chk_color = "#34d399" if passed else "#fb7185"
-            bg_badge = "rgba(16,185,129,0.15)" if passed else "rgba(244,63,94,0.15)"
-            detail = chk.get("detail", "")
-            st.markdown(f"""
-            <div style="display:flex; justify-content:space-between; align-items:center; padding: 8px 12px; border-radius:8px; margin-bottom: 4px; background: rgba(15,23,42,0.4);">
-                <div style="color: #cbd5e1; font-size: 0.9rem; font-weight: 500;">
-                    <span style="color:{chk_color}; font-weight:800; margin-right:8px;">{icon}</span> {chk["name"]}
-                </div>
-                <div style="color: #64748b; font-size: 0.8rem; font-family:'JetBrains Mono';">
-                    {detail}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
+    ordered_results = sorted(results, key=lambda table: (-results[table].get("failed", 0), table))
+    with st.container(border=True):
+        panel_heading("Check results", "Select a Silver table to review its assertions.")
+        for tab, table in zip(st.tabs([table.title() for table in ordered_results]), ordered_results, strict=True):
+            with tab:
+                checks = sorted(results[table].get("checks", []), key=lambda check: bool(check.get("passed")))
+                rows = [
+                    {
+                        "Check": check["name"],
+                        "Result": "Passed" if check.get("passed") else "Failed",
+                        "Detail": check.get("detail", ""),
+                    }
+                    for check in checks
+                ]
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                else:
+                    st.info("This table has no recorded assertions.")
 
 
 # ── Page: Time Travel ──────────────────────────────────────────────────────────
 
 def page_time_travel():
-    st.markdown("""
-    <div style="margin-bottom: 20px;">
-        <h1 style="margin:0; font-size: 2.1rem; font-weight: 800;">🔍 Delta Lake Time Travel</h1>
-        <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
-            Query historical table states AS OF any transaction version or timestamp via ACID commit logs
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    page_heading("Time Travel", "Inspect older Silver snapshots and review the Delta commit history.")
+    table_column, version_column = st.columns(2)
+    with table_column:
+        selected_table = st.selectbox("Silver table", TABLES, format_func=str.title)
+    versions = sorted(load_delta_versions(selected_table), key=lambda entry: entry["version"], reverse=True)
+    if not versions:
+        st.info(f"No Delta commit history is available for {selected_table}.")
+        return
 
-    c_left, c_right = st.columns([1, 2])
+    version_numbers = [entry["version"] for entry in versions]
+    timestamps = {entry["version"]: format_utc(entry.get("timestamp")) for entry in versions}
+    with version_column:
+        selected_version = st.selectbox(
+            "Snapshot version", version_numbers,
+            index=1 if len(version_numbers) > 1 else 0,
+            format_func=lambda version: f"v{version} · {timestamps[version]}",
+            key=f"snapshot-{selected_table}",
+        )
 
-    with c_left:
-        selected_table = st.selectbox("Select Target Table", ["customers", "orders", "products"])
-        versions = load_delta_versions(selected_table)
+    snapshot = load_silver_as_of_version(selected_table, selected_version)
+    if "error" in snapshot.columns:
+        st.error(str(snapshot["error"].iloc[0]))
+        return
 
-        if not versions:
-            st.warning(f"No Delta transaction history found for `{selected_table}`.")
-            return
+    metrics = [
+        ("Selected version", f"v{selected_version}", timestamps[selected_version]),
+        ("Latest version", f"v{version_numbers[0]}", timestamps[version_numbers[0]]),
+        ("Snapshot rows", f"{len(snapshot):,}", f"{active_row_count(snapshot):,} active"),
+    ]
+    cards = "".join(stat_card_markup(*metric) for metric in metrics)
+    st.markdown(f'<div class="overview-metrics snapshot-metrics">{cards}</div>', unsafe_allow_html=True)
 
-        version_options = {
-            f"Version {v.get('version', i)} — {str(v.get('timestamp', ''))[:19]}": v.get('version', i)
-            for i, v in enumerate(reversed(versions))
-        }
-        selected_label = st.selectbox("Time Travel Snapshot Version", list(version_options.keys()))
-        selected_version = version_options[selected_label]
-
-        st.markdown(f"""
-        <div style="background: rgba(30,41,59,0.5); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; margin-top: 14px;">
-            <div style="font-size:0.75rem; text-transform:uppercase; color:#94a3b8; font-weight:700;">Python Query API</div>
-            <pre style="margin-top:8px; padding:10px; background:rgba(15,23,42,0.8); border-radius:8px; color:#38bdf8; font-size:0.82rem; overflow-x:auto;">
-from deltalake import DeltaTable
-
-dt = DeltaTable("silver/{selected_table}",
-                version={selected_version})
-df = dt.to_pandas()</pre>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with c_right:
-        st.markdown(f'<div class="section-header-modern"><span>📋 Table Snapshot AS OF Version {selected_version}</span></div>', unsafe_allow_html=True)
-        hist_df = load_silver_as_of_version(selected_table, selected_version)
-        if "error" in hist_df.columns:
-            st.error(hist_df["error"].iloc[0])
-        else:
-            st.caption(f"Snapshot contains **{len(hist_df)}** records at this specific commit point.")
-            display_cols = [c for c in hist_df.columns if not c.startswith("__")]
-            st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True)
-
-    st.markdown('<div class="section-header-modern"><span>📜 Delta Lake ACID Transaction Log (`_delta_log/`)</span></div>', unsafe_allow_html=True)
-    if versions:
-        log_records = []
-        for v in versions:
-            log_records.append({
-                "Version": v.get("version", ""),
-                "Commit Timestamp (UTC)": str(v.get("timestamp", ""))[:19],
-                "Delta Operation": v.get("operation", ""),
-                "Engine Client": v.get("clientVersion", ""),
-            })
-        st.dataframe(pd.DataFrame(log_records), use_container_width=True, hide_index=True)
+    snapshot_tab, history_tab = st.tabs(["Snapshot rows", "Commit history"])
+    with snapshot_tab:
+        st.dataframe(snapshot, use_container_width=True, hide_index=True)
+        with st.expander("Python query"):
+            st.code(
+                f'from deltalake import DeltaTable\n\n'
+                f'rows = DeltaTable("silver/{selected_table}", version={selected_version}).to_pandas()',
+                language="python",
+            )
+    with history_tab:
+        history = [
+            {
+                "Version": entry["version"],
+                "Committed (UTC)": timestamps[entry["version"]],
+                "Operation": entry.get("operation", ""),
+                "Writer": entry.get("clientVersion", ""),
+            }
+            for entry in versions
+        ]
+        st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
 
 
 # ── Main Entrypoint ────────────────────────────────────────────────────────────
 
 def main():
-    selected_page = render_sidebar()
-
-    if selected_page.startswith("🏠"):
-        page_overview()
-    elif selected_page.startswith("📡"):
-        page_cdc_feed()
-    elif selected_page.startswith("👥"):
-        page_customers()
-    elif selected_page.startswith("📦"):
-        page_orders()
-    elif selected_page.startswith("🏷️"):
-        page_products()
-    elif selected_page.startswith("✅"):
-        page_data_quality()
-    elif selected_page.startswith("🔍"):
-        page_time_travel()
+    pages = {
+        "Overview": page_overview,
+        "CDC Feed": page_cdc_feed,
+        "Customers": page_customers,
+        "Orders": page_orders,
+        "Products": page_products,
+        "Data Quality": page_data_quality,
+        "Time Travel": page_time_travel,
+    }
+    pages[render_sidebar()]()
 
 
 if __name__ == "__main__":

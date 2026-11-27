@@ -30,6 +30,7 @@ dbt_project/.user.yml
 
 # Great Expectations runtime state
 data_quality/gx/gx/uncommitted/
+data_quality/runtime_results/
 
 # Local package downloads
 deltalake-*.whl

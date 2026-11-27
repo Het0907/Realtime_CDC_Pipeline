@@ -1,12 +1,15 @@
 [CmdletBinding()]
 param(
     [switch]$SkipPipeline,
-    [switch]$KeepConsumerLog
+    [switch]$KeepConsumerLog,
+    [switch]$ReuseServices
 )
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
+$venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
+$python = if (Test-Path $venvPython) { $venvPython } else { "python" }
 
 function Invoke-RequiredCommand {
     param(
@@ -95,8 +98,44 @@ function Wait-ForConsumer {
     throw "Bronze consumer did not become ready within $TimeoutSeconds seconds."
 }
 
-Write-Host "Starting CDC demo services..." -ForegroundColor Cyan
-Invoke-RequiredCommand "docker" @("compose", "up", "-d")
+function Wait-ForDemoEvents {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [hashtable]$ExpectedEvents,
+        [datetime]$StartedAt,
+        [int]$TimeoutSeconds = 90
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $seenFiles = @{}
+    do {
+        if ($Process.HasExited) {
+            throw "Bronze consumer exited while capturing demo events. Check $consumerErrorLog."
+        }
+        foreach ($file in Get-ChildItem -Path "bronze_layer" -Filter "*.json" -Recurse) {
+            if ($file.LastWriteTimeUtc -lt $StartedAt -or $seenFiles.ContainsKey($file.FullName)) {
+                continue
+            }
+            $event = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+            $seenFiles[$file.FullName] = $true
+            $id = if ($event.operation -eq "d") { $event.before.id } else { $event.after.id }
+            $ExpectedEvents.Remove("$($event.table):$($event.operation):$id")
+        }
+        if ($ExpectedEvents.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+
+    throw "Timed out waiting for Bronze events: $($ExpectedEvents.Keys -join ', '). Check $consumerLog."
+}
+
+if ($ReuseServices) {
+    Write-Host "Using the running CDC demo services..." -ForegroundColor Cyan
+} else {
+    Write-Host "Starting CDC demo services..." -ForegroundColor Cyan
+    Invoke-RequiredCommand "docker" @("compose", "up", "-d")
+}
 $connectors = Wait-ForConnectApi
 if ($connectors -notcontains "inventory-connector") {
     Write-Host "Registering the inventory Debezium connector..." -ForegroundColor Cyan
@@ -105,18 +144,7 @@ if ($connectors -notcontains "inventory-connector") {
 }
 Wait-ForConnector
 
-$connector = $null
-try {
-    $connector = Invoke-RestMethod -Uri "http://localhost:8083/connectors/inventory-connector/status" -Method Get
-} catch {
-    throw "Could not read the Debezium connector status."
-}
-
-if ($connector.connector.state -ne "RUNNING" -or $connector.tasks[0].state -ne "RUNNING") {
-    throw "Debezium connector is not healthy: connector=$($connector.connector.state), task=$($connector.tasks[0].state)"
-}
-
-$runId = Get-Date -Format "yyyyMMddHHmmss"
+$runId = Get-Date -Format "yyyyMMddHHmmssfff"
 $customerEmail = "demo.$runId@example.com"
 $deletedEmail = "deleted.$runId@example.com"
 $productName = "Demo Widget $runId"
@@ -124,40 +152,48 @@ $consumerLog = Join-Path $projectRoot ".demo-consumer-$runId.log"
 $consumerErrorLog = Join-Path $projectRoot ".demo-consumer-$runId.err.log"
 
 Write-Host "Starting the bronze consumer..." -ForegroundColor Cyan
-$consumer = Start-Process -FilePath "python" `
+$consumer = Start-Process -FilePath $python `
     -ArgumentList @("-u", "consumer.py", "--group-id", "bronze-demo") `
     -WorkingDirectory $projectRoot `
     -RedirectStandardOutput $consumerLog `
     -RedirectStandardError $consumerErrorLog `
+    -WindowStyle Hidden `
     -PassThru
 
 try {
     Wait-ForConsumer -Process $consumer -OutputLog $consumerLog -ErrorLog $consumerErrorLog
 
     Write-Host "Creating ecommerce CDC events..." -ForegroundColor Cyan
-    $customerId = (& docker exec postgres psql -U postgres -d inventory -qAt -c "INSERT INTO inventory.customers (first_name, last_name, email) VALUES ('Demo', 'Customer', '$customerEmail') RETURNING id;").Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($customerId)) {
-        throw "Could not create the demo customer."
+    $startedAt = [datetime]::UtcNow
+    $psql = @("exec", "postgres", "psql", "-U", "postgres", "-d", "inventory", "-qAt", "-v", "ON_ERROR_STOP=1", "-c")
+    $sql = @"
+BEGIN;
+INSERT INTO inventory.customers (first_name, last_name, email) VALUES ('Demo', 'Customer', '$customerEmail');
+UPDATE inventory.customers SET first_name='UpdatedDemo' WHERE email='$customerEmail';
+INSERT INTO inventory.products (name, description, weight) VALUES ('$productName', 'Repeatable CDC demo product', 1.5);
+INSERT INTO inventory.orders (order_date, purchaser, quantity, product_id)
+SELECT CURRENT_DATE, c.id, 2, p.id FROM inventory.customers c CROSS JOIN inventory.products p
+WHERE c.email='$customerEmail' AND p.name='$productName' RETURNING purchaser, product_id, id;
+INSERT INTO inventory.customers (first_name, last_name, email) VALUES ('Deleted', 'Demo', '$deletedEmail');
+DELETE FROM inventory.customers WHERE email='$deletedEmail' RETURNING id;
+COMMIT;
+"@
+    $ids = @(Invoke-RequiredCommand "docker" ($psql + $sql))
+    if ($ids.Count -ne 2 -or $ids[0] -notmatch '^\d+\|\d+\|\d+$' -or $ids[1] -notmatch '^\d+$') {
+        throw "Postgres did not return the customer, product, order, and deleted customer IDs."
     }
-
-    & docker exec postgres psql -U postgres -d inventory -c "UPDATE inventory.customers SET first_name='UpdatedDemo' WHERE id=$customerId;"
-    if ($LASTEXITCODE -ne 0) { throw "Could not update the demo customer." }
-
-    $productId = (& docker exec postgres psql -U postgres -d inventory -qAt -c "INSERT INTO inventory.products (name, description, weight) VALUES ('$productName', 'Repeatable CDC demo product', 1.5) RETURNING id;").Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($productId)) {
-        throw "Could not create the demo product."
+    $customerId, $productId, $orderId = $ids[0] -split '\|'
+    $deletedId = $ids[1]
+    $expectedEvents = @{
+        "customers:c:$customerId" = $true
+        "customers:u:$customerId" = $true
+        "products:c:$productId" = $true
+        "orders:c:$orderId" = $true
+        "customers:c:$deletedId" = $true
+        "customers:d:$deletedId" = $true
     }
-
-    & docker exec postgres psql -U postgres -d inventory -c "INSERT INTO inventory.orders (order_date, purchaser, quantity, product_id) VALUES (CURRENT_DATE, $customerId, 2, $productId);"
-    if ($LASTEXITCODE -ne 0) { throw "Could not create the demo order." }
-
-    & docker exec postgres psql -U postgres -d inventory -c "INSERT INTO inventory.customers (first_name, last_name, email) VALUES ('Deleted', 'Demo', '$deletedEmail');"
-    if ($LASTEXITCODE -ne 0) { throw "Could not create the delete-test customer." }
-
-    & docker exec postgres psql -U postgres -d inventory -c "DELETE FROM inventory.customers WHERE email='$deletedEmail';"
-    if ($LASTEXITCODE -ne 0) { throw "Could not create the delete CDC event." }
-
-    Start-Sleep -Seconds 5
+    Write-Host "Waiting for all six demo events in Bronze..." -ForegroundColor Cyan
+    Wait-ForDemoEvents -Process $consumer -ExpectedEvents $expectedEvents -StartedAt $startedAt
 } finally {
     if ($consumer -and -not $consumer.HasExited) {
         Stop-Process -Id $consumer.Id -Force
@@ -169,7 +205,13 @@ Write-Host "Bronze events available: $eventCount" -ForegroundColor Green
 
 if (-not $SkipPipeline) {
     Write-Host "Running Silver, quality, dbt, and schema-test stages..." -ForegroundColor Cyan
-    Invoke-RequiredCommand "python" @("pipeline/run_pipeline.py")
+    $previousSource = $env:CDC_BRONZE_SOURCE
+    $env:CDC_BRONZE_SOURCE = "json"
+    try {
+        Invoke-RequiredCommand $python @("pipeline/run_pipeline.py")
+    } finally {
+        $env:CDC_BRONZE_SOURCE = $previousSource
+    }
 }
 
 if (-not $KeepConsumerLog -and (Test-Path $consumerLog)) {
@@ -181,4 +223,5 @@ if (-not $KeepConsumerLog -and (Test-Path $consumerErrorLog)) {
 
 Write-Host "Demo complete." -ForegroundColor Green
 Write-Host "Customer id: $customerId | Product id: $productId"
-Write-Host "Open the dashboard with: streamlit run dashboard/app.py"
+Write-Host 'For the JSON dashboard, set $env:CDC_BRONZE_SOURCE = "json"'
+Write-Host "Then run: & '$python' -m streamlit run dashboard/app.py"

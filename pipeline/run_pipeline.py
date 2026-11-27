@@ -63,10 +63,8 @@ def main():
 
     venv_scripts = PROJECT_ROOT / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
     venv_python = venv_scripts / ("python.exe" if sys.platform == "win32" else "python")
-    venv_dbt = venv_scripts / ("dbt.exe" if sys.platform == "win32" else "dbt")
-
     python_bin = str(venv_python) if venv_python.exists() else sys.executable
-    dbt_base = [str(venv_dbt)] if venv_dbt.exists() else [python_bin, "-m", "dbt.cli.main"]
+    dbt_base = [python_bin, "-m", "dbt.cli.main"]
 
     console.print(Panel(
         f"[bold white]CDC Lakehouse Pipeline\n[dim]{run_start.isoformat()}Z",
